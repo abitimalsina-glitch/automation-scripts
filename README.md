@@ -1,3 +1,2 @@
-
 # Automation Scripts
-Automating the boring stuff using Python and bash
+Automating the boring stuff
