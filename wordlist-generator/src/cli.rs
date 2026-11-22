@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(long, group = "mode")]
     pub generate: bool,
 
+    /// Generate a synthetic password dataset to a file
+    #[arg(long, group = "mode")]
+    pub dataset: bool,
+
     /// Minimum password length (analyze mode)
     #[arg(long)]
     pub min_length: Option<usize>,
@@ -49,4 +53,16 @@ pub struct Cli {
     /// Hypothetical guesses per second for time estimation (analyze mode)
     #[arg(long)]
     pub rate: Option<u64>,
+
+    /// Number of password records to generate (dataset mode)
+    #[arg(long)]
+    pub count: Option<u64>,
+
+    /// Length of each generated password record (dataset mode)
+    #[arg(long)]
+    pub record_length: Option<usize>,
+
+    /// Output file path for the dataset (dataset mode)
+    #[arg(long)]
+    pub output: Option<String>,
 }
