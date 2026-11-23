@@ -27,6 +27,10 @@ pub enum AppError {
         path: String,
         message: String,
     },
+    InteractiveQuit,
+    InputError {
+        message: String,
+    },
 }
 
 impl fmt::Display for AppError {
@@ -67,6 +71,8 @@ impl fmt::Display for AppError {
             AppError::FileError { path, message } => {
                 write!(f, "file error for '{path}': {message}")
             }
+            AppError::InteractiveQuit => write!(f, "session terminated."),
+            AppError::InputError { message } => write!(f, "input error: {message}"),
         }
     }
 }
@@ -144,6 +150,18 @@ mod tests {
             }
             .to_string(),
             "file error for '/tmp/test.txt': permission denied"
+        );
+    }
+
+    #[test]
+    fn test_interactive_error_display() {
+        assert_eq!(AppError::InteractiveQuit.to_string(), "session terminated.");
+        assert_eq!(
+            AppError::InputError {
+                message: "broken pipe".to_string()
+            }
+            .to_string(),
+            "input error: broken pipe"
         );
     }
 }
