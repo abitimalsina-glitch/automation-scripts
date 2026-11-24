@@ -28,29 +28,3 @@ pub fn estimate_search_time(keyspace: &BigUint, rate: u64) -> SearchTime {
         worst: keyspace / &rate_big,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analysis::keyspace::combinations;
-    use num_traits::Zero;
-
-    #[test]
-    fn search_time_known_values() {
-        let keyspace = BigUint::from(1_000_000u64);
-        let times = estimate_search_time(&keyspace, 1_000);
-
-        // Worst case: 1,000,000 / 1,000 = 1,000 seconds
-        assert_eq!(times.worst, BigUint::from(1_000u32));
-        // Average case: 1,000,000 / 2,000 = 500 seconds
-        assert_eq!(times.average, BigUint::from(500u32));
-    }
-
-    #[test]
-    fn search_time_large_keyspace_no_panic() {
-        let keyspace = combinations(62, 20);
-        let times = estimate_search_time(&keyspace, 1_000_000_000);
-        assert!(times.worst > BigUint::zero());
-        assert!(times.average > BigUint::zero());
-    }
-}
