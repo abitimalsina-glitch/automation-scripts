@@ -9,6 +9,7 @@ use crate::config::{
 };
 use crate::error::AppError;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 /// Run the interactive configuration flow using stdin/stdout.
 pub fn run_interactive() -> Result<Config, AppError> {
@@ -115,7 +116,12 @@ fn collect_dataset(
     let record_length = prompt_validated_length(reader, writer, "Record length")?;
 
     writeln_to(writer, "");
-    let output_path = prompt_non_empty(reader, writer, "Output file path: ")?;
+    let output_dir = prompt_output_directory(reader, writer)?;
+    let output_filename = prompt_output_filename(reader, writer)?;
+    let output_path = output_dir
+        .join(output_filename)
+        .to_string_lossy()
+        .into_owned();
 
     let charset = match prompt_charset(reader, writer)? {
         None => return Ok(None),
@@ -358,20 +364,100 @@ fn prompt_optional_u64(
     }
 }
 
-/// Prompt for a non-empty string.
-fn prompt_non_empty(
+/// Validate an output directory: must exist, be a directory, and be writable.
+pub(crate) fn validate_output_directory(dir_str: &str) -> Result<PathBuf, String> {
+    let trimmed = dir_str.trim();
+    if trimmed.is_empty() {
+        return Err("Directory path cannot be empty.".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(format!("Directory '{}' does not exist.", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(format!("Path '{}' is not a directory.", path.display()));
+    }
+    check_dir_writable(&path)
+        .map_err(|e| format!("Directory '{}' is not writable: {e}", path.display()))?;
+
+    Ok(path)
+}
+
+/// Check that a directory can be used for writing by probing with a temporary file.
+pub(crate) fn check_dir_writable(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.permissions().readonly() {
+        return Err("permission denied (directory is read-only)".to_string());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe_path = path.join(format!(
+        ".keyspace_probe_{}_{}.tmp",
+        std::process::id(),
+        nanos
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe_path);
+            Ok(())
+        }
+        Err(e) => Err(format!("permission denied ({e})")),
+    }
+}
+
+/// Validate an output filename: non-empty, single normal component, no path separators or traversal.
+pub(crate) fn validate_filename(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Filename cannot be empty.".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
+        return Err("Filename must not contain path separators or null bytes.".to_string());
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("Filename cannot be '.' or '..'.".to_string());
+    }
+    let path = Path::new(trimmed);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(trimmed.to_string()),
+        _ => Err("Invalid filename.".to_string()),
+    }
+}
+
+/// Prompt for a valid, writable output directory.
+fn prompt_output_directory(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-    prompt: &str,
+) -> Result<PathBuf, AppError> {
+    loop {
+        write_to(writer, "Output directory: ");
+        let line = read_line(reader)?;
+        match validate_output_directory(&line) {
+            Ok(dir) => return Ok(dir),
+            Err(err) => writeln_to(writer, &format!("  Error: {err}")),
+        }
+    }
+}
+
+/// Prompt for a valid output filename without path traversal.
+fn prompt_output_filename(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
 ) -> Result<String, AppError> {
     loop {
-        write_to(writer, prompt);
+        write_to(writer, "Output filename: ");
         let line = read_line(reader)?;
-        let trimmed = line.trim().to_string();
-        if !trimmed.is_empty() {
-            return Ok(trimmed);
+        match validate_filename(&line) {
+            Ok(filename) => return Ok(filename),
+            Err(err) => writeln_to(writer, &format!("  Error: {err}")),
         }
-        writeln_to(writer, "  Please enter a value.");
     }
 }
 
@@ -456,8 +542,8 @@ mod tests {
 
     #[test]
     fn interactive_dataset() {
-        // Generate → Dataset → count=5000 → len=16 → output → charset=digits
-        let config = session("1\n2\n5000\n16\n/tmp/out.txt\n3\n").unwrap();
+        // Generate → Dataset → count=5000 → len=16 → output dir + filename → charset=digits
+        let config = session("1\n2\n5000\n16\n/tmp\nout.txt\n3\n").unwrap();
         assert_eq!(
             config.mode,
             Mode::Dataset {
@@ -568,7 +654,7 @@ mod tests {
     #[test]
     fn dataset_zero_count_reprompts() {
         // Generate → Dataset → count=0 (invalid) → count=100 → rest valid
-        let config = session("1\n2\n0\n100\n8\n/tmp/x.txt\n1\n").unwrap();
+        let config = session("1\n2\n0\n100\n8\n/tmp\nx.txt\n1\n").unwrap();
         assert!(matches!(config.mode, Mode::Dataset { count: 100, .. }));
     }
 
@@ -595,15 +681,15 @@ mod tests {
 
     #[test]
     fn empty_output_path_reprompts() {
-        // Generate → Dataset → count=10 → len=8 → "" empty → "/tmp/a.txt" → charset
-        let config = session("1\n2\n10\n8\n\n/tmp/a.txt\n1\n").unwrap();
+        // Generate → Dataset → count=10 → len=8 → "" empty dir/filename → "/tmp" / "a.txt" → charset
+        let config = session("1\n2\n10\n8\n\n/tmp\n\na.txt\n1\n").unwrap();
         assert!(matches!(config.mode, Mode::Dataset { .. }));
     }
 
     #[test]
     fn back_from_dataset_charset() {
-        // Generate → Dataset → count=100 → len=12 → path → 0 (back) → Calculate keyspace
-        let config = session("1\n2\n100\n12\n/tmp/x.txt\n0\n2\n5\n10\n1\n\n").unwrap();
+        // Generate → Dataset → count=100 → len=12 → dir + filename → 0 (back) → Calculate keyspace
+        let config = session("1\n2\n100\n12\n/tmp\nx.txt\n0\n2\n5\n10\n1\n\n").unwrap();
         assert!(matches!(config.mode, Mode::Analyze { .. }));
     }
 
@@ -640,5 +726,148 @@ mod tests {
         // Lowercase (26) + Uppercase (26) + Digits (10) + Symbols (32) = 94
         let config = session("1\n1\n10\n1,2,3,4\n").unwrap();
         assert_eq!(config.charset.len(), 94);
+    }
+
+    // ── Directory and Filename validation tests ──────────────────────────
+
+    #[test]
+    fn test_valid_absolute_directory() {
+        let temp_dir = std::env::temp_dir();
+        let res = validate_output_directory(&temp_dir.to_string_lossy());
+        assert!(res.is_ok());
+        let path = res.unwrap();
+        assert!(path.is_absolute());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn test_valid_relative_directory() {
+        let res = validate_output_directory(".");
+        assert!(res.is_ok());
+        let path = res.unwrap();
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn test_nonexistent_directory() {
+        let res = validate_output_directory("/nonexistent_directory_keyspace_12345");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_file_as_directory_rejected() {
+        let res = validate_output_directory("Cargo.toml");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not a directory"));
+    }
+
+    #[test]
+    fn test_empty_directory_rejected() {
+        let res = validate_output_directory("");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("cannot be empty"));
+
+        let res = validate_output_directory("   ");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_empty_filename() {
+        assert!(validate_filename("").is_err());
+        assert!(validate_filename("   ").is_err());
+    }
+
+    #[test]
+    fn test_invalid_filename() {
+        // Traversal and separators
+        assert!(validate_filename("..").is_err());
+        assert!(validate_filename(".").is_err());
+        assert!(validate_filename("../passwords.txt").is_err());
+        assert!(validate_filename("foo/bar.txt").is_err());
+        assert!(validate_filename("foo\\bar.txt").is_err());
+        assert!(validate_filename("/root.txt").is_err());
+        assert!(validate_filename("null\0byte.txt").is_err());
+    }
+
+    #[test]
+    fn test_valid_filenames() {
+        assert_eq!(validate_filename("dataset.txt").unwrap(), "dataset.txt");
+        assert_eq!(
+            validate_filename("wordlist_100k.csv").unwrap(),
+            "wordlist_100k.csv"
+        );
+        assert_eq!(validate_filename(".hidden").unwrap(), ".hidden");
+        assert_eq!(validate_filename("passwords").unwrap(), "passwords");
+    }
+
+    #[test]
+    fn test_successful_output_path_construction() {
+        let dir = validate_output_directory(".").unwrap();
+        let filename = validate_filename("dataset_test.txt").unwrap();
+        let full_path = dir.join(&filename);
+        assert_eq!(full_path, Path::new(".").join("dataset_test.txt"));
+        assert_eq!(full_path.file_name().unwrap(), "dataset_test.txt");
+    }
+
+    #[test]
+    fn test_cli_output_compatibility() {
+        use crate::cli::Cli;
+        let cli = Cli {
+            analyze: false,
+            generate: false,
+            dataset: true,
+            min_length: None,
+            max_length: None,
+            length: None,
+            lowercase: true,
+            uppercase: false,
+            digits: true,
+            symbols: false,
+            custom: None,
+            rate: None,
+            count: Some(500),
+            record_length: Some(16),
+            output: Some("/tmp/legacy_cli_output.txt".to_string()),
+        };
+        let cfg = Config::from_cli(&cli).unwrap();
+        assert_eq!(
+            cfg.mode,
+            Mode::Dataset {
+                count: 500,
+                record_length: 16,
+                output_path: "/tmp/legacy_cli_output.txt".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_graceful_handling_of_filesystem_errors() {
+        let res = check_dir_writable(Path::new("/nonexistent_path_probe_test"));
+        assert!(res.is_err());
+
+        let res = check_dir_writable(Path::new("Cargo.toml"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_interactive_dataset_reprompts_on_directory_and_filename_errors() {
+        // Generate -> Dataset -> count=50 -> len=8 ->
+        // dir: "" -> dir: "/nonexistent_dir_9999" -> dir: "/tmp" ->
+        // filename: "" -> filename: "../traversal.txt" -> filename: "data.txt" ->
+        // charset: 1
+        let config = session(
+            "1\n2\n50\n8\n\n/nonexistent_dir_9999\n/tmp\n\n../traversal.txt\ndata.txt\n1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.mode,
+            Mode::Dataset {
+                count: 50,
+                record_length: 8,
+                output_path: "/tmp/data.txt".to_string(),
+            }
+        );
     }
 }
