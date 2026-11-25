@@ -1,0 +1,5 @@
+# Root-level ignore rules
+# Root-level ignore rules
+wordlist-generator/target/
+**/target/
+**/target/
